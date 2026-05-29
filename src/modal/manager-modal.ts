@@ -153,6 +153,8 @@ export class ManagerModal extends Modal {
     private renderGeneration = 0;
     private searchRenderTimer?: number;
     private searchSaveTimer?: number;
+    private commandRefreshTimer?: number;
+    private settingsSaveTimer?: number;
     private searchIndex = new Map<string, PluginSearchIndexEntry>();
     private pluginManifestCache?: { source: Record<string, PluginManifest>; plugins: PluginManifest[] };
     private readonly renderBatchSize = 80;
@@ -201,6 +203,45 @@ export class ManagerModal extends Modal {
         if (this.settings.PERSISTENCE) this.settings.FILTER_SEARCH = value;
         this.scheduleSearchPersistence();
         this.scheduleSearchReload();
+    }
+
+    private shouldRefreshCommandsForPluginState(): boolean {
+        return Boolean(this.settings.COMMAND_ITEM || this.settings.COMMAND_GROUP);
+    }
+
+    private refreshCommandsNow() {
+        if (!this.shouldRefreshCommandsForPluginState()) return;
+        Commands(this.app, this.manager);
+    }
+
+    private clearScheduledCommandRefresh() {
+        if (this.commandRefreshTimer === undefined) return;
+        window.clearTimeout(this.commandRefreshTimer);
+        this.commandRefreshTimer = undefined;
+    }
+
+    private scheduleCommandRefresh() {
+        if (!this.shouldRefreshCommandsForPluginState()) return;
+        if (this.commandRefreshTimer !== undefined) window.clearTimeout(this.commandRefreshTimer);
+        this.commandRefreshTimer = window.setTimeout(() => {
+            this.commandRefreshTimer = undefined;
+            this.refreshCommandsNow();
+        }, 0);
+    }
+
+    private scheduleSettingsSave() {
+        if (this.settingsSaveTimer !== undefined) window.clearTimeout(this.settingsSaveTimer);
+        this.settingsSaveTimer = window.setTimeout(() => {
+            this.settingsSaveTimer = undefined;
+            void this.manager.saveSettings();
+        }, 250);
+    }
+
+    private async flushScheduledSettingsSave() {
+        if (this.settingsSaveTimer === undefined) return;
+        window.clearTimeout(this.settingsSaveTimer);
+        this.settingsSaveTimer = undefined;
+        await this.manager.saveSettings();
     }
 
     private isRenderCurrent(renderGeneration: number, page: ManagerPage): boolean {
@@ -645,6 +686,45 @@ export class ManagerModal extends Modal {
         }
     }
 
+    private updatePluginCardEnabledState(
+        pluginId: string,
+        targetEnabled: boolean,
+        removeFromCurrentFilter = true
+    ) {
+        const card = this.contentEl.querySelector<HTMLElement>(`.manager-plugin-card[data-plugin-id="${pluginId}"]`);
+        if (!card) return;
+        const statusChip = card.querySelector<HTMLElement>(".manager-plugin-card__state");
+        const icon = card.querySelector<HTMLElement>(".manager-plugin-card__icon");
+        const openSettingsButton = card.querySelector<HTMLElement>('[aria-label="' + this.manager.translator.t("管理器_打开设置_描述") + '"]');
+        const statusFilter = this.getStatusFilterValue();
+        const statusOperator = this.getStatusFilterOperator();
+        const removeByFilter = removeFromCurrentFilter && (statusOperator === "contains"
+            ? ((statusFilter === "enabled" && !targetEnabled) || (statusFilter === "disabled" && targetEnabled))
+            : ((statusFilter === "enabled" && targetEnabled) || (statusFilter === "disabled" && !targetEnabled)));
+
+        card.toggleClass("is-enabled", targetEnabled);
+        card.toggleClass("is-disabled", !targetEnabled);
+        if (this.settings.FADE_OUT_DISABLED_PLUGINS) card.toggleClass("inactive", !targetEnabled);
+        if (statusChip) {
+            statusChip.setText(targetEnabled ? this.manager.translator.t("管理器_状态_启用中") : this.manager.translator.t("管理器_状态_已禁用"));
+            statusChip.removeClass(targetEnabled ? "is-disabled" : "is-enabled");
+            statusChip.addClass(targetEnabled ? "is-enabled" : "is-disabled");
+        }
+        if (icon) {
+            icon.empty();
+            setIcon(icon, targetEnabled ? "plug-zap" : "plug");
+        }
+        if (openSettingsButton) {
+            if (openSettingsButton instanceof HTMLButtonElement) openSettingsButton.disabled = !targetEnabled;
+            openSettingsButton.style.display = targetEnabled ? "" : "none";
+        }
+        if (removeByFilter) {
+            card.detach();
+            this.displayPlugins = this.displayPlugins.filter((plugin) => plugin.id !== pluginId);
+        }
+        this.updateStats();
+    }
+
     private getMainPageActionPlacement(actionId: MainPageActionId) {
         return this.settings.MAIN_PAGE_ACTION_PLACEMENT?.[actionId]
             ?? DEFAULT_MAIN_PAGE_ACTION_PLACEMENT[actionId];
@@ -714,14 +794,17 @@ export class ManagerModal extends Modal {
     private async singleStartPlugin(plugin: PluginManifest) {
         new Notice(this.manager.translator.t("管理器_单次启动中_提示"));
         await this.appPlugins.enablePlugin(plugin.id);
-        await this.reloadShowData();
+        this.updatePluginCardEnabledState(plugin.id, true);
+        this.scheduleCommandRefresh();
     }
 
     private async restartPlugin(plugin: PluginManifest) {
         new Notice(this.manager.translator.t("管理器_重启中_提示"));
         await this.appPlugins.disablePluginAndSave(plugin.id);
+        this.updatePluginCardEnabledState(plugin.id, false, false);
         await this.appPlugins.enablePluginAndSave(plugin.id);
-        await this.reloadShowData();
+        this.updatePluginCardEnabledState(plugin.id, true);
+        this.scheduleCommandRefresh();
     }
 
     private togglePluginHidden(pluginId: string) {
@@ -813,9 +896,9 @@ export class ManagerModal extends Modal {
                 managerPlugin.enabled = false;
                 await this.appPlugins.disablePluginAndSave(plugin.id);
             }
-            await this.manager.savePluginAndExport(plugin.id);
         }
-        Commands(this.app, this.manager);
+        await this.manager.saveSettings();
+        this.refreshCommandsNow();
         await this.reloadShowData();
     }
 
@@ -1073,7 +1156,7 @@ export class ManagerModal extends Modal {
         }
         progress.hide();
         await this.manager.saveSettings();
-        Commands(this.app, this.manager);
+        this.refreshCommandsNow();
         await this.reloadShowData();
         new Notice(t("批量编辑_已更新状态", { count: plugins.length }));
     }
@@ -2881,13 +2964,12 @@ export class ManagerModal extends Modal {
                         if (this.settings.DELAY) {
                             if (targetEnabled) {
                                 managerPluginForToggle.enabled = true;
-                                await this.manager.savePluginAndExport(plugin.id);
                                 await this.appPlugins.enablePlugin(plugin.id);
                             } else {
                                 managerPluginForToggle.enabled = false;
-                                await this.manager.savePluginAndExport(plugin.id);
                                 await this.appPlugins.disablePlugin(plugin.id);
                             }
+                            this.scheduleSettingsSave();
                         } else {
                             if (targetEnabled) {
                                 managerPluginForToggle.enabled = true;
@@ -2896,9 +2978,9 @@ export class ManagerModal extends Modal {
                                 managerPluginForToggle.enabled = false;
                                 await this.appPlugins.disablePluginAndSave(plugin.id);
                             }
-                            await this.manager.savePluginAndExport(plugin.id);
+                            this.scheduleSettingsSave();
                         }
-                        Commands(this.app, this.manager);
+                        this.scheduleCommandRefresh();
                         updateCardUI();
                     });
                 }
@@ -5794,6 +5876,8 @@ export class ManagerModal extends Modal {
 
     public async onClose() {
         this.clearScheduledSearchWork();
+        this.clearScheduledCommandRefresh();
+        await this.flushScheduledSettingsSave();
         if (this.settings.PERSISTENCE && this.settings.FILTER_SEARCH !== this.searchText) {
             this.settings.FILTER_SEARCH = this.searchText;
             void this.manager.saveSettings();
